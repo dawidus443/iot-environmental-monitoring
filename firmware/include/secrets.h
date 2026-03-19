@@ -1,0 +1,5 @@
+#define WIFI_SSID "PLAYCC123F7"
+#define WIFI_PASSWORD "ekwbjrmy6r3S"
+#define SUPABASE_URL "https://poivlzgibasmmriwgpug.supabase.co/rest/v1/sensor_data"
+#define SUPABASE_TELEMETRY_URL "https://poivlzgibasmmriwgpug.supabase.co/rest/v1/telemetry"
+#define SUPABASE_KEY "sb_publishable_fJBAvtLi3JiOh1-Dq6uO8Q_De8wMPDt"
