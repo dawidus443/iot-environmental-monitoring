@@ -1,0 +1,34 @@
+# Secrets
+secrets.h
+*.env
+.env*
+profiles.yml
+terraform.tfvars
+
+# Build artifacts
+.pio/
+build/
+dist/
+*.o
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Python
+__pycache__/
+venv/
+.venv/
+*.egg-info/
+dist/
+build/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Node
+node_modules/
+package-lock.json
