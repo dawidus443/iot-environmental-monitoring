@@ -1,10 +1,10 @@
-# IoT Environmental Monitoring — Data Engineering Portfolio
+# IoT Environmental Monitoring — Data Engineering
 
 Full-stack data engineering project demonstrating **pipeline architecture** from hardware collection through cloud storage, transformations, orchestration, and analytics.
 
 **Stack:** ESP32 (C++) → Supabase (PostgreSQL) → dbt → Dagster → Grafana
 
-## 📁 Modules
+## Modules
 
 - **[firmware/](firmware/)** — ESP32 sensor data collection (Phase 1 ✅)
 - **[backend/](backend/)** — dbt transformations (Phase 2)
@@ -12,7 +12,7 @@ Full-stack data engineering project demonstrating **pipeline architecture** from
 - **[grafana/](grafana/)** — Visualization dashboards
 - **[docs/](docs/)** — Architecture and design
 
-## 🚀 Quick Start
+## Quick Start
 
 See [firmware/README.md](firmware/README.md) for ESP32 setup instructions.
 
