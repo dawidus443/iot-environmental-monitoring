@@ -1,6 +1,6 @@
-# ESP32 Monitoring System (DHT22, Soil Sensors )
+# ESP32 Environmental Monitoring System (Data Engineering Ready)
 
-A comprehensive IoT monitoring system built on ESP32 that collects environmental data from multiple sensors and stores it in Supabase cloud database.
+A comprehensive IoT monitoring system built on ESP32 for data engineering applications. Collects environmental data from multiple sensors and stores it in Supabase cloud database with structured telemetry for ETL processing.
 
 ## Overview
 
@@ -10,7 +10,37 @@ This project monitors environmental conditions using an ESP32 microcontroller wi
 - **Cloud Data Synchronization** with automatic retry mechanism
 - **Offline Data Storage** with automatic sync when WiFi reconnects
 - **WiFi Management** with exponential backoff reconnection strategy
-- **System Telemetry** - tracks upload success rates and system health metrics
+- **System Telemetry** - tracks upload success rates, device health, and connectivity metrics
+- **Data Engineering Ready** - structured data with device IDs, timestamps, and metadata for ETL pipelines
+
+## Data Structure for ETL
+
+### Sensor Data (sensor_data table)
+Each record contains:
+- `device_id` (text): MAC address of the ESP32 device
+- `created_at` (timestamp): Measurement timestamp (Unix epoch, sent from ESP32)
+- `uptime` (integer): Device uptime in seconds
+- `rssi` (integer): WiFi signal strength in dBm
+- `event_type` (text): Always "sensor_data"
+- `temperature` (float): Temperature in °C
+- `humidity` (float): Air humidity in %
+- `soil_moisture_1/2/3` (integer): Soil moisture percentages
+
+### Telemetry Data (telemetry table)
+Each record contains:
+- `device_id` (text): MAC address of the ESP32 device
+- `created_at` (timestamp): Telemetry timestamp (Unix epoch, sent from ESP32)
+- `uptime` (integer): Device uptime in seconds
+- `rssi` (integer): WiFi signal strength in dBm
+- `event_type` (text): Always "telemetry"
+- `esp_temperature` (float): Internal ESP32 temperature in °C
+- `spiffs_used_bytes` (integer): SPIFFS flash memory used in bytes
+- `spiffs_total_bytes` (integer): SPIFFS flash memory total capacity in bytes
+- `heap_free_bytes` (integer): Current free heap memory in bytes
+- `heap_min_free_bytes` (integer): Minimum free heap since startup in bytes
+- `successful_uploads` (integer): Number of successful data uploads
+- `failed_uploads` (integer): Number of failed data uploads
+- `total_attempts` (integer): Total upload attempts
 
 ## Hardware Requirements
 
@@ -32,8 +62,9 @@ This project monitors environmental conditions using an ESP32 microcontroller wi
 ## Project Structure
 
 ```
-esp32-dht22/
+iot-environmental-monitoring/firmware/
 ├── platformio.ini           # PlatformIO configuration
+├── README.md                # This file
 ├── include/
 │   ├── README
 │   └── secrets.h           # WiFi and Supabase credentials -> .gitignore
@@ -48,6 +79,8 @@ esp32-dht22/
 ├── lib/
 │   └── README
 └── test/
+    └── README
+```
     └── README
 ```
 
@@ -68,16 +101,21 @@ Handles WiFi connectivity with intelligent retry logic.
 Manages cloud data synchronization using Supabase REST API.
 - Stores failed uploads locally using SPIFFS filesystem
 - Automatic retry of previously failed uploads when WiFi reconnects
-- Telemetry tracking with periodic health reports
+- Telemetry tracking with periodic health reports including device uptime and WiFi RSSI
 - Sends system metrics every 10 cycles (~50 minutes)
+- Includes device identification and event type for data engineering
 
 ### Main Loop
 ```cpp
-- Runs every 5 minutes (~300 seconds)
+- Runs every 5 minutes (default), or 1 minute for 5 cycles if temperature changes by ≥1°C or humidity by ≥2%
+- Runs every 5 minutes (default), or 1 minute for 5 cycles if temperature changes by ≥1°C or humidity by ≥3%
+- Counter resets on new changes during fast mode
 - Reads sensors (temperature, humidity, soil moisture)
 - Syncs any stored offline data to Supabase
-- Sends current readings to Supabase sensor_data table
-- Sends telemetry metrics every 10 cycles (~50 minutes)
+- Sends current readings to Supabase sensor_data table with metadata
+- Sends telemetry metrics every 10 cycles (~50 minutes) with device health data
+- Sends telemetry metrics every 12 cycles (~1 hour) with device health data
+- Sends structured logs (ERROR/WARN/INFO) to logs table on events
 - Automatically reconnects to WiFi if needed
 ```
 
@@ -102,10 +140,12 @@ SoilSensor soil1(34, 2600, 830);  // (pin, dryValue, wetValue)
 ```
 
 ### Measurement Interval
-Change the loop delay in `main.cpp`:
-```cpp
-delay(300000);  // 5 minutes in milliseconds
-```
+Default: 5 minutes. Dynamic adjustment:
+- **1 minute for 5 measurements** if temperature changes by ≥1°C or humidity by ≥2% (detects rapid environmental changes)
+- Counter resets if another change is detected during fast mode
+- **5 minutes** otherwise (conserves bandwidth and storage)
+
+This optimizes data collection for data engineering — burst of data during events, less during stable periods.
 
 ## Setup & Installation
 
@@ -117,15 +157,20 @@ Create two tables in your Supabase project using SQL Editor:
 ```sql
 create table sensor_data (
   id bigint primary key generated always as identity,
-  created_at timestamp with time zone default now(),
+  created_at timestamp with time zone not null,
+  device_id text not null,
+  uptime integer not null,
+  rssi integer not null,
+  event_type text not null,
   temperature float not null,
   humidity float not null,
-  soil_moisture_1 int,
-  soil_moisture_2 int,
-  soil_moisture_3 int
+  soil_moisture_1 integer,
+  soil_moisture_2 integer,
+  soil_moisture_3 integer
 );
 
 create index idx_sensor_data_created_at on sensor_data(created_at desc);
+create index idx_sensor_data_device_id on sensor_data(device_id);
 alter table sensor_data enable row level security;
 create policy "Allow inserts from app" on sensor_data for insert with check (true);
 ```
@@ -134,14 +179,23 @@ create policy "Allow inserts from app" on sensor_data for insert with check (tru
 ```sql
 create table telemetry (
   id bigint primary key generated always as identity,
-  created_at timestamp with time zone default now(),
-  successful_uploads int not null,
-  failed_uploads int not null,
-  success_rate float not null,
-  total_attempts int not null
+  created_at timestamp with time zone not null,
+  device_id text not null,
+  uptime integer not null,
+  rssi integer not null,
+  event_type text not null,
+  esp_temperature float not null,
+  spiffs_used_bytes integer not null,
+  spiffs_total_bytes bigint not null,
+  heap_free_bytes bigint not null,
+  heap_min_free_bytes bigint not null,
+  successful_uploads integer not null,
+  failed_uploads integer not null,
+  total_attempts integer not null
 );
 
 create index idx_telemetry_created_at on telemetry(created_at desc);
+create index idx_telemetry_device_id on telemetry(device_id);
 alter table telemetry enable row level security;
 create policy "Allow inserts from app" on telemetry for insert with check (true);
 ```
@@ -154,7 +208,7 @@ create policy "Allow inserts from app" on telemetry for insert with check (true)
 
 3. **Configure credentials** in `include/secrets.h`:
    - Get REST API URL from Supabase project settings
-   - Append `/rest/v1/sensor_data` and `/rest/v1/telemetry` to the base URL
+  - Append `/rest/v1/sensor_data`, `/rest/v1/telemetry`, and `/rest/v1/logs` to the base URL
 
 4. **Upload to ESP32**:
    ```bash
@@ -170,24 +224,37 @@ create policy "Allow inserts from app" on telemetry for insert with check (true)
 
 ✅ **Dual-mode operation**: Offline storage + Cloud sync  
 ✅ **Fault tolerance**: Automatic WiFi reconnection with backoff  
-✅ **Real-time monitoring**: 5-minute sensor read interval  
+✅ **Real-time monitoring**: 5-minute sensor read interval (dynamic: 1 min for 5 cycles on ≥1°C temp or ≥2% humidity change)  
+✅ **Real-time monitoring**: 5-minute sensor read interval (dynamic: 1 min for 5 cycles on ≥1°C temp or ≥3% humidity change)
 ✅ **Multi-sensor support**: Temperature, humidity, and 3 soil moisture sensors  
 ✅ **Cloud integration**: Seamless Supabase synchronization  
 ✅ **Low power design**: Optimized delay between readings  
-✅ **System telemetry**: Automatic health metrics collection  
-✅ **Data persistence**: SPIFFS offline storage with automatic retry
+✅ **System telemetry**: Automatic health metrics collection with device metadata, ESP32 temp, and memory usage  
+✅ **Data persistence**: SPIFFS offline storage with automatic retry  
+✅ **Data Engineering Ready**: Structured data with device IDs, uptime, and RSSI for ETL
 
 ## Telemetry & Monitoring
 
 ### What Gets Tracked
+- **Device ID** - MAC address for device identification
+- **Uptime** - Device runtime in seconds
+- **RSSI** - WiFi signal strength in dBm
+- **Event Type** - Data type classification ("sensor_data" or "telemetry")
+- **ESP Temperature** - Internal ESP32 temperature (°C) for overheating detection
+- **Memory Usage** - SPIFFS storage usage (%) to monitor data accumulation
 - **Successful uploads** - number of successful data sends to Supabase
 - **Failed uploads** - number of failed data transmissions
-- **Success rate** - percentage of successful uploads
 - **Total attempts** - total number of upload attempts
-- **Timestamps** - when each telemetry snapshot was taken
+- **Timestamps** - auto-generated by Supabase when data is inserted
 
 ### Telemetry Behavior
 - Telemetry is automatically sent to Supabase every 10 measurement cycles (~50 minutes)
+- Telemetry is automatically sent to Supabase every 12 measurement cycles (~1 hour)
+- **Memory Usage** - Raw memory metrics in bytes for ETL analysis:
+  - `spiffs_used_bytes` - SPIFFS flash memory currently used (bytes)
+  - `spiffs_total_bytes` - Total SPIFFS flash capacity (bytes)  
+  - `heap_free_bytes` - Current free heap memory (bytes)
+  - `heap_min_free_bytes` - Minimum free heap since startup (bytes)
 - Stored in the `telemetry` table for analysis
 - Metrics reset when ESP32 restarts
 - View real-time stats in serial monitor: `supabase.printTelemetry()`
@@ -195,21 +262,69 @@ create policy "Allow inserts from app" on telemetry for insert with check (true)
 ### Use Cases for Telemetry Data
 ✅ **System Health Monitoring** - detect WiFi or connectivity issues  
 ✅ **Data Engineering** - analyze data quality and collection reliability  
+✅ **Device Fleet Management** - track multiple ESP32 devices  
+✅ **Network Analysis** - monitor WiFi signal strength over time  
 ✅ **Alerting** - set up notifications if success_rate drops below threshold  
 ✅ **Historical Analysis** - track system performance over time  
 ✅ **SLA Tracking** - measure uptime and reliability metrics
 
-## Troubleshooting
+## Data Engineering & ETL Integration
 
-### DHT Sensor Errors
-- Check wiring on GPIO 13
-- Ensure sensor is powered correctly
-- Verify DHT11 (not DHT22) is selected
+This system is designed for data engineering workflows with structured data ready for ETL processing:
 
-### WiFi Connection Issues
-- Check SSID and password in `secrets.h`
-- Monitor exponential backoff delays in serial output
-- Check router WiFi signal strength
+### Data Flow
+1. **Extract**: ESP32 collects sensor data and telemetry with precise timestamps
+2. **Load**: Data is stored in Supabase with measurement timestamps
+3. **Transform**: Use ETL tools to process and analyze data
+
+### ETL Recommendations
+- **Success Rate Calculation**: Compute `success_rate = successful_uploads / total_attempts` in your ETL pipeline
+- **Device Monitoring**: Track `uptime` and `rssi` for device health analysis
+- **Time Series Analysis**: Use `created_at` for temporal aggregations
+- **Multi-Device Support**: Filter by `device_id` for fleet management
+
+### Example ETL Queries
+```sql
+-- Calculate success rate per device
+SELECT 
+  device_id,
+  AVG(successful_uploads::float / total_attempts) as avg_success_rate,
+  AVG(rssi) as avg_rssi
+FROM telemetry 
+GROUP BY device_id;
+
+-- Daily sensor averages
+SELECT 
+  DATE(created_at) as date,
+  device_id,
+  AVG(temperature) as avg_temp,
+  AVG(humidity) as avg_humidity
+FROM sensor_data 
+GROUP BY DATE(created_at), device_id
+ORDER BY date DESC;
+
+-- Device health monitoring
+SELECT 
+  device_id,
+  created_at,
+  esp_temperature,
+  memory_usage_percent,
+    spiffs_used_bytes,
+    heap_free_bytes,
+  rssi
+FROM telemetry 
+WHERE esp_temperature > 60 OR memory_usage_percent > 80
+WHERE esp_temperature > 60 OR heap_free_bytes < 50000
+ORDER BY created_at DESC;
+```
+
+## Contributing
+
+This project is optimized for data engineering applications. For enhancements, consider:
+- Additional sensor types
+- Battery level monitoring
+- Advanced telemetry metrics
+- Integration with ETL tools like Apache Airflow or dbt
 - Watch for reconnection patterns in telemetry
 
 ### Data Upload Failures

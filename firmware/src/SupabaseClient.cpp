@@ -1,9 +1,13 @@
 #include "SupabaseClient.h"
 #include <WiFi.h>
 #include <SPIFFS.h>
+#include <time.h>  
 
-SupabaseClient::SupabaseClient(const char* url, const char* key, const char* telemetryUrl)
-  : _url(url), _key(key), _telemetryUrl(telemetryUrl) {}
+#define STORAGE_FILE "/data.txt"
+#define TEMP_FILE "/temp.txt"
+
+SupabaseClient::SupabaseClient(const char* url, const char* key, const char* telemetryUrl, const char* logsUrl)
+  : _url(url), _key(key), _telemetryUrl(telemetryUrl), _logsUrl(logsUrl), _timeClient(_ntpUDP) {}
 
 void SupabaseClient::initStorage() {
   if (!SPIFFS.begin(true)) {
@@ -11,16 +15,34 @@ void SupabaseClient::initStorage() {
   } else {
     Serial.println("SPIFFS initialized");
   }
+  _timeClient.begin();
+  _timeClient.setTimeOffset(0);
 }
 
+// 🔹 helper: ISO8601 time (local timezone)
+String SupabaseClient::getISOTime() {
+  _timeClient.update();
+  time_t now = _timeClient.getEpochTime();
+  struct tm *timeinfo = localtime(&now);  // ✔ Changed from gmtime to localtime
+
+  char buffer[30];
+  strftime(buffer, sizeof(buffer), "%Y-%m-%dT%H:%M:%S", timeinfo);
+  return String(buffer);
+}
+
+// 🔹 zapis offline (JUŻ z created_at)
 void SupabaseClient::saveSensorDataOffline(float temperature, float humidity, int soil1, int soil2, int soil3) {
   File file = SPIFFS.open(STORAGE_FILE, "a");
   if (!file) {
-    Serial.println("Failed to open storage file for writing");
+    Serial.println("Failed to open storage file");
     return;
   }
 
   StaticJsonDocument<256> doc;
+  doc["device_id"] = _deviceId;
+  doc["created_at"] = getISOTime();   // ✔ KLUCZOWE
+  doc["uptime"] = millis() / 1000;
+  doc["rssi"] = WiFi.RSSI();
   doc["temperature"] = temperature;
   doc["humidity"] = humidity;
   doc["soil_moisture_1"] = soil1;
@@ -30,35 +52,27 @@ void SupabaseClient::saveSensorDataOffline(float temperature, float humidity, in
   serializeJson(doc, file);
   file.println();
   file.close();
-  
-  Serial.println("Data saved to storage");
+
+  Serial.println("Saved offline");
 }
 
+// 🔹 wysyłanie z retry (BEZ utraty danych)
 void SupabaseClient::sendStoredData() {
-  if (WiFi.status() != WL_CONNECTED) {
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  File input = SPIFFS.open(STORAGE_FILE, "r");
+  if (!input || input.size() == 0) return;
+
+  File temp = SPIFFS.open(TEMP_FILE, "w");
+  if (!temp) {
+    Serial.println("Failed to open temp file");
     return;
   }
 
-  File file = SPIFFS.open(STORAGE_FILE, "r");
-  if (!file || file.size() == 0) {
-    return;
-  }
-
-  int sentCount = 0;
-  while (file.available()) {
-    String line = file.readStringUntil('\n');
+  while (input.available()) {
+    String line = input.readStringUntil('\n');
     line.trim();
-    
     if (line.length() == 0) continue;
-
-    StaticJsonDocument<256> doc;
-    DeserializationError error = deserializeJson(doc, line);
-    
-    if (error) {
-      Serial.print("JSON parse error: ");
-      Serial.println(error.c_str());
-      continue;
-    }
 
     HTTPClient http;
     http.begin(_url);
@@ -67,45 +81,41 @@ void SupabaseClient::sendStoredData() {
     http.addHeader("apikey", _key);
     http.addHeader("Authorization", "Bearer " + String(_key));
 
-    String body;
-    serializeJson(doc, body);
+    int code = http.POST(line);
 
-    int responseCode = http.POST(body);
-    
-    if (responseCode == 200 || responseCode == 201) {
+    if (code == 200 || code == 201) {
       _successfulUploads++;
-      sentCount++;
-      Serial.printf("Stored data sent: %d | Total uploads: %d\n", responseCode, _successfulUploads);
     } else {
-      Serial.printf("Failed to send stored data: %d\n", responseCode);
+      _failedUploads++;
+      temp.println(line); // ✔ zachowaj nieudane
     }
+
     http.end();
   }
 
-  file.close();
+  input.close();
+  temp.close();
 
-  if (sentCount > 0) {
-    SPIFFS.remove(STORAGE_FILE);
-    Serial.printf("Cleared storage after sending %d records\n", sentCount);
-  }
+  SPIFFS.remove(STORAGE_FILE);
+  SPIFFS.rename(TEMP_FILE, STORAGE_FILE);
+
+  Serial.println("Retry cycle finished");
 }
 
+// 🔹 wysyłka danych live
 void SupabaseClient::sendSensorData(float temperature, float humidity, int soil1, int soil2, int soil3) {
   if (WiFi.status() != WL_CONNECTED) {
     _failedUploads++;
+    sendLog("WARN", "wifi", "No WiFi, saving offline");
     saveSensorDataOffline(temperature, humidity, soil1, soil2, soil3);
-    Serial.println("No WiFi! Data saved to storage. Failed uploads: " + String(_failedUploads));
     return;
   }
 
-  HTTPClient http;
-  http.begin(_url);
-  http.setTimeout(5000);
-  http.addHeader("Content-Type", "application/json");
-  http.addHeader("apikey", _key);
-  http.addHeader("Authorization", "Bearer " + String(_key));
-
   StaticJsonDocument<256> doc;
+  doc["device_id"] = _deviceId;
+  doc["created_at"] = getISOTime();
+  doc["uptime"] = millis() / 1000;
+  doc["rssi"] = WiFi.RSSI();
   doc["temperature"] = temperature;
   doc["humidity"] = humidity;
   doc["soil_moisture_1"] = soil1;
@@ -115,34 +125,66 @@ void SupabaseClient::sendSensorData(float temperature, float humidity, int soil1
   String body;
   serializeJson(doc, body);
 
-  int responseCode = http.POST(body);
-  
-  if (responseCode == 200 || responseCode == 201) {
+  HTTPClient http;
+  http.begin(_url);
+  http.setTimeout(5000);
+  http.addHeader("Content-Type", "application/json");
+  http.addHeader("apikey", _key);
+  http.addHeader("Authorization", "Bearer " + String(_key));
+
+  int code = http.POST(body);
+  String response = http.getString();  // 🔥 DODAJ
+
+  if (code == 200 || code == 201) {
     _successfulUploads++;
-    Serial.printf("Supabase success: %d | Total uploads: %d\n", responseCode, _successfulUploads);
+    Serial.printf("Data sent: %d | Success: %d\n", code, _successfulUploads);
   } else {
     _failedUploads++;
-    Serial.printf("Supabase error: %d | Failed uploads: %d\n", responseCode, _failedUploads);
+    Serial.printf("Send failed: %d | Failed: %d\n", code, _failedUploads);
+    char ctx[64];
+    snprintf(ctx, sizeof(ctx), "{\"http_code\":%d}", code);
+    sendLog("ERROR", "supabase", "HTTP POST failed", ctx);
+    saveSensorDataOffline(temperature, humidity, soil1, soil2, soil3);
   }
+
+  // 🔥 DODAJ ZAWSZE (debug)
+  Serial.println("Response: " + response);
+
   http.end();
 }
 
+// 🔹 telemetry (rozszerzona)
 void SupabaseClient::sendTelemetry() {
-  if (WiFi.status() != WL_CONNECTED) {
-    return;
-  }
-
-  if (_telemetryUrl == nullptr) {
-    Serial.println("Telemetry URL not configured");
-    return;
-  }
+  if (WiFi.status() != WL_CONNECTED || _telemetryUrl == nullptr) return;
 
   uint32_t total = _successfulUploads + _failedUploads;
-  if (total == 0) {
-    return;
-  }
+  if (total == 0) return;
 
-  float successRate = (_successfulUploads * 100.0f) / total;
+  float espTempF = temperatureRead();
+  float espTemp = (espTempF - 32) / 1.8;
+  
+  // Raw memory data
+  uint32_t spiffsUsed = SPIFFS.usedBytes();
+  uint32_t spiffsTotal = SPIFFS.totalBytes();
+  uint32_t heapFree = ESP.getFreeHeap();
+  uint32_t heapMin = ESP.getMinFreeHeap();
+
+  StaticJsonDocument<512> doc;
+  doc["device_id"] = _deviceId;
+  doc["created_at"] = getISOTime();
+  doc["uptime"] = millis() / 1000;
+  doc["rssi"] = WiFi.RSSI();
+  doc["esp_temperature"] = espTemp;
+  doc["spiffs_used_bytes"] = spiffsUsed;
+  doc["spiffs_total_bytes"] = spiffsTotal;
+  doc["heap_free_bytes"] = heapFree;
+  doc["heap_min_free_bytes"] = heapMin;
+  doc["successful_uploads"] = _successfulUploads;
+  doc["failed_uploads"] = _failedUploads;
+  doc["total_attempts"] = total;
+
+  String body;
+  serializeJson(doc, body);
 
   HTTPClient http;
   http.begin(_telemetryUrl);
@@ -151,32 +193,54 @@ void SupabaseClient::sendTelemetry() {
   http.addHeader("apikey", _key);
   http.addHeader("Authorization", "Bearer " + String(_key));
 
-  StaticJsonDocument<256> doc;
-  doc["successful_uploads"] = _successfulUploads;
-  doc["failed_uploads"] = _failedUploads;
-  doc["success_rate"] = successRate;
-  doc["total_attempts"] = total;
+  int code = http.POST(body);
+
+  if (code != 200 && code != 201) {
+    Serial.printf("Telemetry failed: %d\n", code);
+    char ctx[64];
+    snprintf(ctx, sizeof(ctx), "{\"http_code\":%d}", code);
+    sendLog("ERROR", "supabase", "Telemetry POST failed", ctx);
+  }
+
+  http.end();
+}
+
+// 🔹 debug
+void SupabaseClient::printTelemetry() const {
+  uint32_t total = _successfulUploads + _failedUploads;
+
+  Serial.println("--- Telemetry ---");
+  Serial.printf("OK: %d | FAIL: %d | TOTAL: %d\n",
+                _successfulUploads,
+                _failedUploads,
+                total);
+}
+
+bool SupabaseClient::isTimeReady() {
+  _timeClient.update();
+  return _timeClient.getEpochTime() > 100000;
+}
+
+void SupabaseClient::sendLog(const char* level, const char* source, const char* message, const char* context) {
+  if (WiFi.status() != WL_CONNECTED || _logsUrl == nullptr) return; // logi nie są buforowane offline
+
+  StaticJsonDocument<512> doc;
+  doc["device_id"] = _deviceId;
+  doc["created_at"] = getISOTime();
+  doc["level"] = level;
+  doc["source"] = source;
+  doc["message"] = message;
+  if (context != nullptr) doc["context"] = context; // np. JSON jako string
 
   String body;
   serializeJson(doc, body);
 
-  int responseCode = http.POST(body);
-  
-  if (responseCode == 200 || responseCode == 201) {
-    Serial.printf("Telemetry sent | Success rate: %.1f%% | Total: %d\n", successRate, total);
-  } else {
-    Serial.printf("Failed to send telemetry: %d\n", responseCode);
-  }
+  HTTPClient http;
+  http.begin(_logsUrl); // osobny endpoint: /rest/v1/logs
+  http.setTimeout(5000);
+  http.addHeader("Content-Type", "application/json");
+  http.addHeader("apikey", _key);
+  http.addHeader("Authorization", "Bearer " + String(_key));
+  http.POST(body);
   http.end();
-}
-
-void SupabaseClient::printTelemetry() const {
-  uint32_t total = _successfulUploads + _failedUploads;
-  if (total == 0) {
-    Serial.println("--- Supabase Telemetry: No data sent yet ---");
-    return;
-  }
-  float successRate = (_successfulUploads * 100.0f) / total;
-  Serial.printf("--- Supabase Telemetry ---\n");
-  Serial.printf("Successful: %d | Failed: %d | Success rate: %.1f%%\n", _successfulUploads, _failedUploads, successRate);
 }
